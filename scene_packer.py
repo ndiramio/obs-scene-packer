@@ -62,7 +62,189 @@ def local_path(value, base, key):
     return None
 
 
-def pack(collection, destination):
+# Static browser dependencies are rewritten to relative URLs, so they survive moves.
+def bundle_web(entry, target, staging):
+    from html.parser import HTMLParser
+    from html import unescape
+    from urllib.parse import quote, urlsplit
+    mapping = {entry.resolve(): target}
+    records, warnings = [], set()
+    dependency_dir = target.parent / (target.stem + '.dependencies')
+
+    def transfer(url, origin, output):
+        value = unescape(url.strip())
+        parsed = urlsplit(value)
+        if not value or value.startswith('#') or parsed.scheme not in ('', 'file') or parsed.netloc:
+            if parsed.scheme in ('http', 'https') or parsed.netloc:
+                warnings.add('Remote resource remains online: ' + value)
+            return url
+        dependency = Path(unquote(parsed.path))
+        if not dependency.is_absolute():
+            dependency = origin.parent / dependency
+        dependency = dependency.resolve()
+        if not dependency.is_file():
+            raise ValueError('Missing local browser dependency: ' + str(dependency))
+        if dependency not in mapping:
+            mapping[dependency] = dependency_dir / (hashlib.sha256(str(dependency).encode()).hexdigest()[:12] + '-' + dependency.name)
+            process(dependency, mapping[dependency])
+        relative = quote(os.path.relpath(mapping[dependency], output.parent).replace(os.sep, '/'), safe='/')
+        return relative + ('?' + parsed.query if parsed.query else '') + ('#' + parsed.fragment if parsed.fragment else '')
+
+    def css(text, origin, output):
+        def replace_url(match):
+            value = match.group(2).strip()
+            return 'url("' + transfer(value, origin, output) + '")'
+        text = re.sub(r'url\(\s*([\"\']?)(.*?)\1\s*\)', replace_url, text, flags=re.I)
+        def replace_import(match):
+            return '@import "' + transfer(match.group(2), origin, output) + '"'
+        return re.sub(r'@import\s+([\"\'])(.*?)\1', replace_import, text, flags=re.I)
+
+    class HTMLBundle(HTMLParser):
+        def __init__(self, origin, output):
+            super().__init__(convert_charrefs=False)
+            self.origin, self.output, self.parts, self.style = origin, output, [], False
+        def handle_starttag(self, tag, attrs):
+            if tag == 'base' and dict(attrs).get('href'):
+                raise ValueError('HTML base href is not supported; remove it or use relative URLs: ' + str(self.origin))
+            raw = self.get_starttag_text()
+            def attr(match):
+                key, value = match.group(1), match.group(3) if match.group(2) else match.group(4)
+                if key.lower() == 'style':
+                    rewritten = css(unescape(value), self.origin, self.output)
+                elif key.lower() == 'srcset':
+                    if 'data:' in value:
+                        warnings.add('Data URL srcset left unchanged: ' + str(self.origin))
+                        return match.group(0)
+                    candidates = []
+                    for candidate in value.split(','):
+                        bits = candidate.strip().split()
+                        if bits:
+                            candidates.append(transfer(bits[0], self.origin, self.output) + (' ' + ' '.join(bits[1:]) if len(bits) > 1 else ''))
+                    rewritten = ', '.join(candidates)
+                else:
+                    rewritten = transfer(value, self.origin, self.output)
+                from html import escape
+                return key + '="' + escape(rewritten, quote=True) + '"'
+            raw = re.sub(r'\b(srcset|src|href|poster|data|style)\s*=\s*(?:([\"\'])(.*?)\2|([^\s>]+))', attr, raw, flags=re.I|re.S)
+            self.parts.append(raw)
+            if tag == 'style': self.style = True
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+        def handle_endtag(self, tag):
+            self.parts.append('</' + tag + '>')
+            if tag == 'style': self.style = False
+        def handle_data(self, data):
+            self.parts.append(css(data, self.origin, self.output) if self.style else data)
+        def handle_entityref(self, name): self.parts.append('&' + name + ';')
+        def handle_charref(self, name): self.parts.append('&#' + name + ';')
+        def handle_comment(self, data): self.parts.append('<!--' + data + '-->')
+        def handle_decl(self, decl): self.parts.append('<!' + decl + '>')
+        def handle_pi(self, data): self.parts.append('<?' + data + '>')
+
+    def process(origin, output):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        suffix = origin.suffix.lower()
+        if suffix in ('.html', '.htm', '.css'):
+            text = origin.read_text(encoding='utf-8-sig')
+            if suffix == '.css':
+                text = css(text, origin, output)
+            else:
+                parser = HTMLBundle(origin, output)
+                parser.feed(text); parser.close(); text = ''.join(parser.parts)
+            output.write_text(text, encoding='utf-8')
+        else:
+            shutil.copy2(origin, output)
+            if suffix in ('.js', '.mjs'):
+                warnings.add('JavaScript runtime loads and module imports need manual review: ' + str(origin))
+        records.append({'original': str(origin), 'relative': output.relative_to(staging).as_posix()})
+    process(entry.resolve(), target)
+    return {'files': records, 'warnings': sorted(warnings)}
+
+
+def font_names(path):
+    """Read OpenType/TrueType name tables, including collection members."""
+    import struct
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 32 * 1024 * 1024: return set()
+        offsets = [0]
+        if raw[:4] == b'ttcf':
+            count = struct.unpack_from('>I', raw, 8)[0]
+            if count > 256: return set()
+            offsets = list(struct.unpack_from('>' + 'I' * count, raw, 12))
+        names = set()
+        for offset in offsets:
+            count = struct.unpack_from('>H', raw, offset + 4)[0]
+            if count > 256: continue
+            for i in range(count):
+                tag, _, start, length = struct.unpack_from('>4sIII', raw, offset + 12 + i * 16)
+                if tag != b'name': continue
+                _, entries, storage = struct.unpack_from('>HHH', raw, start)
+                if entries > 4096: continue
+                for j in range(entries):
+                    platform, _, _, name_id, size, position = struct.unpack_from('>HHHHHH', raw, start + 6 + j * 12)
+                    if name_id in (1, 4, 6, 16):
+                        chunk = raw[start + storage + position:start + storage + position + size]
+                        try: names.add(chunk.decode('utf-16-be' if platform in (0, 3) else 'mac_roman').casefold())
+                        except UnicodeError: pass
+        return names
+    except (OSError, struct.error, ValueError):
+        return set()
+
+
+def dependency_report(data, staging, include_fonts=False, font_dirs=None, plugin_dirs=None):
+    import plistlib
+    required_fonts, types = {}, {}
+    def inspect(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('font'), dict) and node['font'].get('face'):
+                face = node['font']['face']
+                required_fonts.setdefault(face, set()).add(str(node['font'].get('style', 'Regular')))
+            if node.get('id') and isinstance(node.get('settings'), dict):
+                types.setdefault(str(node['id']), set()).add(str(node.get('name', 'Unnamed')))
+            for value in node.values(): inspect(value)
+        elif isinstance(node, list):
+            for value in node: inspect(value)
+    inspect(data)
+    font_dirs = font_dirs if font_dirs is not None else [Path.home() / 'Library/Fonts', Path('/Library/Fonts'), Path('/System/Library/Fonts')]
+    found = {face: [] for face in required_fonts}
+    if required_fonts:
+        for folder in font_dirs:
+            folder = Path(folder).expanduser()
+            if not folder.exists(): continue
+            for file in sorted(folder.rglob('*')):
+                if file.suffix.lower() not in ('.ttf', '.otf', '.ttc', '.otc') or not file.is_file(): continue
+                names = font_names(file)
+                for face in required_fonts:
+                    if face.casefold() in names: found[face].append(file)
+    fonts, copied_fonts = [], {}
+    for face, styles in sorted(required_fonts.items()):
+        matches = []
+        for file in found[face]:
+            item = {'original': str(file), 'system_font': str(file).startswith('/System/Library/')}
+            if include_fonts and not item['system_font']:
+                if file not in copied_fonts:
+                    relative = Path('fonts') / (hashlib.sha256(str(file).encode()).hexdigest()[:12] + '-' + file.name)
+                    (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file, staging / relative)
+                    copied_fonts[file] = relative.as_posix()
+                item['relative'] = copied_fonts[file]
+            matches.append(item)
+        fonts.append({'family': face, 'styles': sorted(styles), 'matches': matches, 'status': 'found' if matches else 'not_found'})
+    plugin_dirs = plugin_dirs if plugin_dirs is not None else [Path.home() / 'Library/Application Support/obs-studio/plugins', Path('/Library/Application Support/obs-studio/plugins')]
+    plugins = []
+    for folder in plugin_dirs:
+        for bundle in sorted(Path(folder).expanduser().glob('*.plugin')):
+            try:
+                with (bundle / 'Contents/Info.plist').open('rb') as f: info = plistlib.load(f)
+                plugins.append({'bundle': bundle.name, 'identifier': info.get('CFBundleIdentifier'), 'version': info.get('CFBundleShortVersionString') or info.get('CFBundleVersion')})
+            except (OSError, ValueError, plistlib.InvalidFileException):
+                plugins.append({'bundle': bundle.name, 'version': None})
+    return {'fonts': fonts, 'required_source_and_filter_types': [{'id': key, 'sources': sorted(value)} for key, value in sorted(types.items())], 'installed_user_plugins': plugins,
+            'instructions': ['Install copied fonts using Font Book before importing. Family names remain unchanged in OBS.', 'System fonts are inventoried but not copied. Font file copying is opt-in; only redistribute files your license permits.', 'Install matching macOS OBS plugins from their publishers. Bundles are inventoried, not copied or installed.', 'Source/filter IDs include OBS built-ins; this report does not map IDs to plugin bundles or guarantee plugin completeness. Frontend-only plugins are not identifiable from collection JSON.']}
+
+
+def pack(collection, destination, include_fonts=False, font_dirs=None, plugin_dirs=None):
     collection = Path(collection).expanduser().resolve()
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
@@ -101,9 +283,10 @@ def pack(collection, destination):
             raise ValueError('Package must not be inside an asset directory.')
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.scene-packer-', dir=str(destination.parent)))
-    manifest = {'version': 1, 'collection': 'collection.json', 'assets': [], 'references': []}
+    manifest = {'version': 2, 'collection': 'collection.json', 'assets': [], 'references': [], 'browser_dependencies': []}
     copied = {}
     try:
+        requirements = dependency_report(data, staging, include_fonts, font_dirs, plugin_dirs)
         for source, trail, value, path, scene_owners in references:
             if path not in copied:
                 all_owners = set().union(*(r[4] for r in references if r[3] == path))
@@ -113,6 +296,8 @@ def pack(collection, destination):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if path.is_dir():
                     shutil.copytree(path, target)
+                elif path.suffix.lower() in ('.html', '.htm'):
+                    manifest['browser_dependencies'].append(bundle_web(path, target, staging))
                 else:
                     shutil.copy2(path, target)
                 copied[path] = relative.as_posix()
@@ -126,7 +311,9 @@ def pack(collection, destination):
                         manifest['references'].append({'trail': [section, index] + list(trail), 'relative': copied[path], 'uri': value.startswith('file://')})
         data['name'] = data.get('name', collection.stem) + ' Portable'
         write_json(staging / 'collection.json', data)
+        manifest['font_files'] = sorted({match['relative'] for font in requirements['fonts'] for match in font['matches'] if 'relative' in match})
         write_json(staging / 'manifest.json', manifest)
+        write_json(staging / 'requirements.json', requirements)
         os.rename(staging, destination)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -138,6 +325,13 @@ def rebase(package):
     root = Path(package).expanduser().resolve()
     manifest = json.loads((root / 'manifest.json').read_text())
     data = json.loads((root / 'collection.json').read_text())
+    extra_files = list(manifest.get('font_files', []))
+    for browser in manifest.get('browser_dependencies', []):
+        extra_files.extend(file['relative'] for file in browser['files'])
+    for relative in extra_files:
+        dependency = (root / relative).resolve()
+        if root not in dependency.parents or not dependency.is_file():
+            raise ValueError('Missing or unsafe package dependency: ' + str(dependency))
     for ref in manifest['references']:
         path = (root / ref['relative']).resolve()
         if root not in path.parents or not path.exists():
@@ -161,6 +355,7 @@ def script_description():
 def script_update(settings):
     for key in ('collection', 'destination', 'package'):
         _config[key] = obs.obs_data_get_string(settings, key)
+    _config['include_fonts'] = obs.obs_data_get_bool(settings, 'include_fonts')
 
 
 def report(action):
@@ -173,7 +368,7 @@ def report(action):
 
 
 def pack_clicked(props, prop):
-    return report(lambda: pack(_config['collection'], _config['destination']))
+    return report(lambda: pack(_config['collection'], _config['destination'], _config.get('include_fonts', False)))
 
 
 def rebase_clicked(props, prop):
@@ -230,6 +425,7 @@ def script_properties():
     props = obs.obs_properties_create()
     obs.obs_properties_add_path(props, 'collection', 'Exported collection JSON', obs.OBS_PATH_FILE, 'JSON (*.json)', None)
     obs.obs_properties_add_text(props, 'destination', 'New package folder (full path)', obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_bool(props, 'include_fonts', 'Copy matched non-system font files (requires redistribution rights)')
     obs.obs_properties_add_button(props, 'pack', 'Gather assets and create portable collection', pack_clicked)
     obs.obs_properties_add_button(props, 'apply', 'Replace paths in current original collection', apply_clicked)
     obs.obs_properties_add_path(props, 'package', 'Moved package folder', obs.OBS_PATH_DIRECTORY, None, None)
@@ -240,7 +436,7 @@ def script_properties():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('pack'); p.add_argument('collection'); p.add_argument('destination')
+    p = sub.add_parser('pack'); p.add_argument('collection'); p.add_argument('destination'); p.add_argument('--include-font-files', action='store_true'); p.add_argument('--font-dir', action='append')
     p = sub.add_parser('rebase'); p.add_argument('package')
     args = parser.parse_args()
-    print(pack(args.collection, args.destination) if args.command == 'pack' else rebase(args.package))
+    print(pack(args.collection, args.destination, args.include_font_files, args.font_dir) if args.command == 'pack' else rebase(args.package))
