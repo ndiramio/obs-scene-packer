@@ -1,0 +1,39 @@
+name: Native macOS
+on:
+  push:
+    paths: ['native/**', '.github/workflows/native-macos.yml', 'test_*.py', 'scene_packer.py']
+  pull_request:
+    paths: ['native/**', '.github/workflows/native-macos.yml', 'test_*.py', 'scene_packer.py']
+  workflow_dispatch:
+jobs:
+  apple-silicon:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install OBS and build tools
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew install --cask obs
+      - name: Compile native plugin
+        run: native/build-macos.sh
+      - name: Run native transfer fixtures
+        run: PACKER_CLI="$PWD/native/build/packer-cli" python3 native/test_native.py
+      - name: Build isolated UI test
+        run: |
+          cmake -S native -B native/build -DPACKER_BUILD_UI_TEST=ON
+          cmake --build native/build --parallel 4
+      - name: Test native interface offscreen
+        run: QT_QPA_PLATFORM=offscreen QT_PLUGIN_PATH="$PWD/native/.deps/qt/plugins" native/build/packer-ui-smoke "$RUNNER_TEMP/native-preview.png" "$PWD/native/build/obs-scene-packer.plugin/Contents/MacOS/obs-scene-packer"
+      - name: Package unsigned alpha
+        run: native/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-arm64-alpha
+          path: |
+            native/dist/*.pkg
+            native/dist/*.zip
+            native/dist/SHA256SUMS.txt
+            ${{ runner.temp }}/native-preview.png

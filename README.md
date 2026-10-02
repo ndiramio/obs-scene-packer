@@ -1,4 +1,14 @@
-# OBS Scene Packer for macOS
+# OBS Scene Packer
+
+## Native macOS plugin alpha
+
+The native C++ plugin runs under **Tools → Scene Packer** and does not require Python. The first alpha targets Apple Silicon Macs, macOS 13 or newer, and OBS 32.x. It includes scene folders, shared assets, collection relinking, static browser dependencies, optional fonts, plugin-bundle transfer, and a recovery snapshot.
+
+[Download the native alpha](https://github.com/ndiramio/obs-scene-packer/releases/tag/v0.2.0-alpha.1) · [Native installation and build instructions](native/README.md)
+
+The alpha installer is unsigned and not notarized. Native transfer fixtures and an isolated Qt/OBS-loader host are tested; full validation inside the running OBS application remains pending because UI automation was unavailable during development. Intel support is not included in this first binary. The Python implementation below remains available during validation.
+
+## Legacy Python script
 
 An OBS Python script extension, not a compiled native plugin. It gathers local files and folders referenced in exported collection source settings, filters, groups, and transitions. It writes a new collection with updated absolute paths, or optionally updates matching sources in your loaded original collection.
 
