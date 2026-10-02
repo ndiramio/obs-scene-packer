@@ -237,14 +237,146 @@ def dependency_report(data, staging, include_fonts=False, font_dirs=None, plugin
         for bundle in sorted(Path(folder).expanduser().glob('*.plugin')):
             try:
                 with (bundle / 'Contents/Info.plist').open('rb') as f: info = plistlib.load(f)
-                plugins.append({'bundle': bundle.name, 'identifier': info.get('CFBundleIdentifier'), 'version': info.get('CFBundleShortVersionString') or info.get('CFBundleVersion')})
+                plugins.append({'original': str(bundle.resolve()), 'bundle': bundle.name, 'identifier': info.get('CFBundleIdentifier'), 'version': info.get('CFBundleShortVersionString') or info.get('CFBundleVersion')})
             except (OSError, ValueError, plistlib.InvalidFileException):
-                plugins.append({'bundle': bundle.name, 'version': None})
+                plugins.append({'original': str(bundle.resolve()), 'bundle': bundle.name, 'version': None})
     return {'fonts': fonts, 'required_source_and_filter_types': [{'id': key, 'sources': sorted(value)} for key, value in sorted(types.items())], 'installed_user_plugins': plugins,
-            'instructions': ['Install copied fonts using Font Book before importing. Family names remain unchanged in OBS.', 'System fonts are inventoried but not copied. Font file copying is opt-in; only redistribute files your license permits.', 'Install matching macOS OBS plugins from their publishers. Bundles are inventoried, not copied or installed.', 'Source/filter IDs include OBS built-ins; this report does not map IDs to plugin bundles or guarantee plugin completeness. Frontend-only plugins are not identifiable from collection JSON.']}
+            'instructions': ['Install copied fonts using Font Book before importing. Family names remain unchanged in OBS.', 'System fonts are inventoried but not copied. Font file copying is opt-in; only redistribute files your license permits.', 'Install matching macOS OBS plugins from their publishers. Bundle copying is opt-in; restoration requires a matching CPU architecture and an OBS restart. External runtimes may require the publisher installer.', 'Source/filter IDs include OBS built-ins; this report does not map IDs to plugin bundles or guarantee plugin completeness. Frontend-only plugins are not identifiable from collection JSON.']}
 
 
-def pack(collection, destination, include_fonts=False, font_dirs=None, plugin_dirs=None):
+def binary_architectures(path):
+    """Read Mach-O headers without executing the plugin."""
+    import struct
+    cpu_names = {0x01000007: 'x86_64', 0x0100000C: 'arm64'}
+    try:
+        with Path(path).open('rb') as file: raw = file.read(16384)
+        magic = raw[:4]
+        if magic in (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe'):
+            endian = '>' if magic[:2] == b'\xfe\xed' else '<'
+            return [cpu_names.get(struct.unpack_from(endian + 'I', raw, 4)[0], 'unsupported')]
+        if magic in (b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
+            endian = '>' if magic[:2] == b'\xca\xfe' else '<'
+            count = struct.unpack_from(endian + 'I', raw, 4)[0]
+            if count > 128: return []
+            stride = 32 if magic in (b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca') else 20
+            return sorted({cpu_names.get(struct.unpack_from(endian + 'I', raw, 8 + index * stride)[0], 'unsupported') for index in range(count)})
+    except (OSError, struct.error): pass
+    return []
+
+
+def validate_plugin_bundle(bundle):
+    import plistlib
+    bundle = Path(bundle).resolve()
+    if not bundle.is_dir() or bundle.suffix != '.plugin':
+        raise ValueError('Not a macOS plugin bundle: ' + str(bundle))
+    for entry in bundle.rglob('*'):
+        if entry.is_symlink():
+            resolved = entry.resolve()
+            if bundle not in resolved.parents or not resolved.exists():
+                raise ValueError('Plugin has a broken or external symlink; use its installer: ' + str(entry))
+    with (bundle / 'Contents/Info.plist').open('rb') as file:
+        info = plistlib.load(file)
+    executable = info.get('CFBundleExecutable', '')
+    if not executable or Path(executable).name != executable or executable in ('.', '..'):
+        raise ValueError('Invalid plugin executable: ' + str(bundle))
+    binary = bundle / 'Contents/MacOS' / executable
+    if not binary.is_file(): raise ValueError('Plugin executable missing: ' + str(binary))
+    return binary_architectures(binary)
+
+
+def bundle_digest(bundle):
+    digest = hashlib.sha256()
+    for entry in sorted(Path(bundle).rglob('*')):
+        digest.update(entry.relative_to(bundle).as_posix().encode() + b'\0')
+        if entry.is_symlink():
+            digest.update(b'link\0' + os.readlink(entry).encode())
+        elif entry.is_file():
+            digest.update(b'file\0' + str(entry.stat().st_mode & 0o777).encode() + b'\0')
+            with entry.open('rb') as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b''): digest.update(chunk)
+        elif entry.is_dir(): digest.update(b'dir\0')
+    return digest.hexdigest()
+
+
+def gather_plugins(report, staging):
+    names = set()
+    for plugin in report['installed_user_plugins']:
+        bundle = Path(plugin['original'])
+        if bundle.name in names:
+            raise ValueError('Duplicate plugin bundle name; select one --plugin-dir: ' + bundle.name)
+        names.add(bundle.name)
+        architectures = validate_plugin_bundle(bundle)
+        if not architectures:
+            raise ValueError('Cannot identify plugin architecture; use its installer: ' + bundle.name)
+        relative = Path('plugins') / bundle.name
+        (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(bundle, staging / relative, symlinks=True)
+        plugin.update({'relative': relative.as_posix(), 'architectures': architectures, 'sha256': bundle_digest(staging / relative)})
+
+
+def install_plugins(package, destination=None):
+    """Install trusted package bundles without overwriting installed plugins."""
+    import platform
+    if platform.system() != 'Darwin':
+        raise ValueError('Plugin restoration is macOS only.')
+    architecture = platform.machine()
+    root = Path(package).expanduser().resolve()
+    report = json.loads((root / 'requirements.json').read_text())
+    destination = Path(destination).expanduser() if destination is not None else Path.home() / 'Library/Application Support/obs-studio/plugins'
+    destination = destination.resolve()
+    pending, skipped, names, identifiers = [], [], set(), set()
+    # Preflight everything before writing destination bundles.
+    import plistlib
+    for installed in destination.glob('*.plugin'):
+        try:
+            with (installed / 'Contents/Info.plist').open('rb') as file: info = plistlib.load(file)
+            identifier = info.get('CFBundleIdentifier')
+            if identifier: identifiers.add(identifier)
+        except (OSError, ValueError, plistlib.InvalidFileException): pass
+    for plugin in report.get('installed_user_plugins', []):
+        if not plugin.get('relative'): continue
+        source = (root / plugin['relative']).resolve()
+        if root not in source.parents: raise ValueError('Plugin path escapes package.')
+        architectures = validate_plugin_bundle(source)
+        if architecture not in architectures:
+            raise ValueError('Plugin ' + source.name + ' does not support this OBS/Python process architecture: ' + architecture)
+        if bundle_digest(source) != plugin.get('sha256'):
+            raise ValueError('Plugin bundle changed or is incomplete: ' + source.name)
+        target = destination / source.name
+        if source.name in names: raise ValueError('Duplicate packaged plugin: ' + source.name)
+        names.add(source.name)
+        if target.exists():
+            if target.is_dir() and bundle_digest(target) == plugin['sha256']:
+                skipped.append(source.name); continue
+            raise ValueError('Installed plugin differs; nothing replaced: ' + str(target))
+        identifier = plugin.get('identifier')
+        if identifier and identifier in identifiers:
+            raise ValueError('Plugin identifier already installed under another name: ' + identifier)
+        if identifier: identifiers.add(identifier)
+        if source == destination or source in destination.parents or destination in source.parents:
+            raise ValueError('Plugin installation folder must be outside packaged bundles.')
+        pending.append((source, target))
+    if not pending:
+        return 'No new bundled plugins to install; already present: ' + ', '.join(skipped)
+    destination.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.scene-packer-install-', dir=str(destination)))
+    installed = []
+    try:
+        for source, target in pending:
+            shutil.copytree(source, staging / source.name, symlinks=True)
+        for source, target in pending:
+            if target.exists(): raise ValueError('Plugin appeared during installation: ' + str(target))
+            os.rename(staging / source.name, target)
+            installed.append(target)
+    except Exception:
+        for target in installed: shutil.rmtree(target)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return 'Installed ' + str(len(installed)) + ' plugin bundles. Restart OBS before importing the collection.'
+
+
+def pack(collection, destination, include_fonts=False, font_dirs=None, plugin_dirs=None, include_plugins=False):
     collection = Path(collection).expanduser().resolve()
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
@@ -287,6 +419,8 @@ def pack(collection, destination, include_fonts=False, font_dirs=None, plugin_di
     copied = {}
     try:
         requirements = dependency_report(data, staging, include_fonts, font_dirs, plugin_dirs)
+        if include_plugins:
+            gather_plugins(requirements, staging)
         for source, trail, value, path, scene_owners in references:
             if path not in copied:
                 all_owners = set().union(*(r[4] for r in references if r[3] == path))
@@ -356,6 +490,7 @@ def script_update(settings):
     for key in ('collection', 'destination', 'package'):
         _config[key] = obs.obs_data_get_string(settings, key)
     _config['include_fonts'] = obs.obs_data_get_bool(settings, 'include_fonts')
+    _config['include_plugins'] = obs.obs_data_get_bool(settings, 'include_plugins')
 
 
 def report(action):
@@ -368,7 +503,15 @@ def report(action):
 
 
 def pack_clicked(props, prop):
-    return report(lambda: pack(_config['collection'], _config['destination'], _config.get('include_fonts', False)))
+    return report(lambda: pack(_config['collection'], _config['destination'], _config.get('include_fonts', False), include_plugins=_config.get('include_plugins', False)))
+
+
+def install_plugins_clicked(props, prop):
+    def install():
+        if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active():
+            raise ValueError('Stop streaming and recording before installing plugins.')
+        return install_plugins(_config['package'])
+    return report(install)
 
 
 def rebase_clicked(props, prop):
@@ -426,9 +569,11 @@ def script_properties():
     obs.obs_properties_add_path(props, 'collection', 'Exported collection JSON', obs.OBS_PATH_FILE, 'JSON (*.json)', None)
     obs.obs_properties_add_text(props, 'destination', 'New package folder (full path)', obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_bool(props, 'include_fonts', 'Copy matched non-system font files (requires redistribution rights)')
+    obs.obs_properties_add_bool(props, 'include_plugins', 'Copy installed third-party plugin bundles')
     obs.obs_properties_add_button(props, 'pack', 'Gather assets and create portable collection', pack_clicked)
     obs.obs_properties_add_button(props, 'apply', 'Replace paths in current original collection', apply_clicked)
     obs.obs_properties_add_path(props, 'package', 'Moved package folder', obs.OBS_PATH_DIRECTORY, None, None)
+    obs.obs_properties_add_button(props, 'install_plugins', 'Install bundled plugins on this Mac (restart OBS afterward)', install_plugins_clicked)
     obs.obs_properties_add_button(props, 'rebase', 'Relink package to this computer', rebase_clicked)
     return props
 
@@ -436,7 +581,13 @@ def script_properties():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('pack'); p.add_argument('collection'); p.add_argument('destination'); p.add_argument('--include-font-files', action='store_true'); p.add_argument('--font-dir', action='append')
+    p = sub.add_parser('pack'); p.add_argument('collection'); p.add_argument('destination'); p.add_argument('--include-font-files', action='store_true'); p.add_argument('--font-dir', action='append'); p.add_argument('--include-plugins', action='store_true'); p.add_argument('--plugin-dir', action='append')
     p = sub.add_parser('rebase'); p.add_argument('package')
+    p = sub.add_parser('install-plugins'); p.add_argument('package'); p.add_argument('--destination')
     args = parser.parse_args()
-    print(pack(args.collection, args.destination, args.include_font_files, args.font_dir) if args.command == 'pack' else rebase(args.package))
+    if args.command == 'pack':
+        print(pack(args.collection, args.destination, args.include_font_files, args.font_dir, args.plugin_dir, args.include_plugins))
+    elif args.command == 'install-plugins':
+        print(install_plugins(args.package, args.destination))
+    else:
+        print(rebase(args.package))
